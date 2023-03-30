@@ -16,6 +16,7 @@ sys.path.append(os.path.join(
 from debugger import build_debugger_process, locate_bin, extract_bpf_arg
 from bcc import BPF, USDT
 import ctypes
+import re
 
 from elftools.elf.elffile import ELFFile
 
@@ -26,7 +27,7 @@ regs = extract_bpf_arg("regs").split(",")
 
 symtab = elf.get_section_by_name(".symtab")
 
-entries = list(filter(lambda symbol: (func_name in symbol.name) and 
+entries = list(filter(lambda symbol: (re.search(func_name, symbol.name)) and
                                      (symbol.entry.st_info.type == "STT_FUNC"),
                       symtab.iter_symbols()))
 
@@ -38,6 +39,8 @@ if len(entries) > 1:
 
 func_name = entries[0].name
 address = entries[0].entry.st_value
+
+print("Profiling func %s" % (func_name))
 
 bpf_text = """
 #include "riscv.h"
