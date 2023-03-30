@@ -1,28 +1,13 @@
 #!/usr/bin/env python3
 
-from bcc import BPF, USDT
-import argparse
-import ctypes
-import os
-import shutil
-from subprocess import Popen, PIPE
 import sys
+import os
+sys.path.append(os.path.join(
+  os.path.dirname(os.path.abspath(__file__)), "..", "contrib"))
 
-parser = argparse.ArgumentParser(
-  prog='functrace',
-  description='ckb-vm-bpf-toolkit funcs')
-parser.add_argument("--ckb-debugger")
-parser.add_argument("--tx-file", required=True)
-parser.add_argument("--cell-type", required=True, choices=["input", "output"])
-parser.add_argument("--script-group-type", required=True, choices=["lock", "type"])
-parser.add_argument("--cell-index", required=True)
-args = parser.parse_args()
-
-ckb_debugger_path = args.ckb_debugger or os.environ.get("CKB_DEBUGGER") or shutil.which("ckb-debugger")
-if ckb_debugger_path is None:
-  print("Please use CKB_DEBUGGER environment variable, or make sure ckb-debugger is in PATH", file=sys.stderr)
-  exit(1)
-ckb_debugger_path = os.path.abspath(ckb_debugger_path)
+from debugger import build_debugger_process
+from bcc import BPF, USDT
+import ctypes
 
 bpf_text = """
 BPF_HASH(stats, uint64_t);
@@ -34,15 +19,7 @@ int do_execute(struct pt_regs *ctx) {
 }
 """
 
-p = Popen([
-  ckb_debugger_path,
-  "--tx-file", args.tx_file,
-  "--cell-type", args.cell_type,
-  "--script-group-type", args.script_group_type,
-  "--cell-index", args.cell_index,
-  "--mode", "probe",
-  "--prompt"
-], stdin=PIPE)
+p = build_debugger_process()
 
 u = USDT(pid=int(p.pid))
 u.enable_probe(probe="ckb_vm:execute_inst", fn_name="do_execute")
