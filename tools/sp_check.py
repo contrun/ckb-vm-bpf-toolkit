@@ -5,12 +5,9 @@ import os
 sys.path.append(os.path.join(
   os.path.dirname(os.path.abspath(__file__)), "..", "contrib"))
 
-def locate_bin():
-  for a, b in zip(sys.argv, sys.argv[1:]):
-    if a == "--bin":
-      return b
-  print("A binary must be provided for inspection!", file=sys.stderr)
-  exit(1)
+from debugger import build_debugger_process, locate_bin
+from bcc import BPF, USDT
+import ctypes
 
 from elftools.elf.elffile import ELFFile
 
@@ -24,18 +21,16 @@ for segment in elf.iter_segments():
     if current_end > elf_end:
       elf_end = current_end
 
-from debugger import build_debugger_process
-from bcc import BPF, USDT
-import ctypes
-
 bpf_text = """
+#include "riscv.h"
+
 BPF_HASH(stats, uint64_t);
 
 int do_execute(struct pt_regs *ctx) {
     uint64_t regs_addr;
     bpf_usdt_readarg(4, ctx, &regs_addr);
     uint64_t sp;
-    bpf_probe_read_user(&sp, sizeof(uint64_t), (void *)(regs_addr + 8 * 2));
+    bpf_probe_read_user(&sp, sizeof(uint64_t), (void *)(regs_addr + 8 * SP));
 
     uint64_t maximum = 0xFFFFFFFFFFFFFFFF, *val, key = 1;
     val = stats.lookup_or_try_init(&key, &maximum);
@@ -53,7 +48,9 @@ p = build_debugger_process()
 
 u = USDT(pid=int(p.pid))
 u.enable_probe(probe="ckb_vm:execute_inst", fn_name="do_execute")
-b = BPF(text=bpf_text, usdt_contexts=[u], cflags=["-Wno-macro-redefined"])
+include_path = os.path.join(
+  os.path.dirname(os.path.abspath(__file__)), "..", "bpfc")
+b = BPF(text=bpf_text, usdt_contexts=[u], cflags=["-Wno-macro-redefined", "-I", include_path])
 
 p.communicate(input="\n".encode())
 print()
