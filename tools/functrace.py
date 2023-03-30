@@ -75,8 +75,6 @@ histo_{reg}.increment(bpf_log2l(reg_{reg}));
 
 bpf_text = bpf_text.replace("@@DEFS@@", def_text).replace("@@ACTIONS@@", action_text)
 
-print(bpf_text)
-
 p = build_debugger_process()
 
 u = USDT(pid=int(p.pid))
