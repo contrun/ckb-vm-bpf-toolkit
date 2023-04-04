@@ -14,7 +14,7 @@ sys.path.append(os.path.join(
   os.path.dirname(os.path.abspath(__file__)), "..", "contrib"))
 
 from debugger import build_debugger_process, locate_bin, extract_bpf_arg
-from elf import decode_funcname
+from elfutils import get_function_address_range
 from bcc import BPF, USDT
 import ctypes
 import re
@@ -26,20 +26,12 @@ elf = ELFFile(open(locate_bin(), "rb"))
 func_name = extract_bpf_arg("func")
 regs = extract_bpf_arg("regs").split(",")
 
-symtab = elf.get_section_by_name(".symtab")
-
-entries = list(filter(lambda symbol: (re.search(func_name, symbol.name)) and
-                                     (symbol.entry.st_info.type == "STT_FUNC"),
-                      symtab.iter_symbols()))
-
-if len(entries) > 1:
-  print("There is more than one entry matching %s, please include more chars to narrow down the search:" % (func_name))
-  for entry in entries:
-    print(entry.name)
+func_range = get_function_address_range(elf, func_name)
+if func_range is None:
+  print("Range for function %s not found" % (func_name))
   exit(1)
 
-func_name = entries[0].name
-address = entries[0].entry.st_value
+func_name, address, func_high_pc = func_range[0], func_range[1], func_range[2]
 
 print("Profiling func %s" % (func_name))
 
