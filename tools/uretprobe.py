@@ -31,7 +31,7 @@ if func_range is None:
   print("Range for function %s not found" % (func_name))
   exit(1)
 
-func_name, address, func_high_pc = func_range[0], func_range[1], func_range[2]
+func_name, func_low_pc, func_high_pc = func_range[0], func_range[1], func_range[2]
 
 print("Profiling func %s" % (func_name))
 
@@ -39,6 +39,8 @@ bpf_text = """
 #include "riscv.h"
 
 BPF_HASH(stats, uint64_t);
+BPF_HASH(instruction_end_stats, uint64_t);
+BPF_HASH(return_value);
 
 @@DEFS@@
 
@@ -67,7 +69,15 @@ int do_execute_end(struct pt_regs *ctx) {
     uint64_t pc;
     bpf_usdt_readarg(1, ctx, &pc);
 
-    if (pc != @@PC@@) {
+    uint64_t current_instruction;
+    bpf_usdt_readarg(3, ctx, &current_instruction);
+
+    if (pc < @@PC@@ || pc >= @@HIGH_PC@@) {
+      return 0;
+    }
+
+    // 0x101000027 is the JALR with rs1 set to RA
+    if (current_instruction != 0x101000027) {
       return 0;
     }
 
@@ -77,15 +87,21 @@ int do_execute_end(struct pt_regs *ctx) {
     uint64_t mem_addr;
     bpf_usdt_readarg(5, ctx, &mem_addr);
 
-    stats.increment(1);
+    uint64_t ret;
+    bpf_probe_read_user(&ret, sizeof(uint64_t), (void *)(regs_addr + 8 * A0));
 
-    @@ACTIONS@@
+    instruction_end_stats.increment(1);
+
+    uint64_t value = 0;
+    return_value.lookup_or_try_init(&ret, &value);
+    value = value+1;
+    return_value.update(&ret, &value);
 
     return 0;
 }
 """
 
-bpf_text = bpf_text.replace("@@PC@@", str(address))
+bpf_text = bpf_text.replace("@@PC@@", str(func_low_pc)).replace("@@HIGH_PC@@", str(func_high_pc))
 
 def_text = "\n".join(map(lambda reg: "BPF_HASH(hash_%s);\nBPF_HASH(hash_mem_%s);" % (reg, reg), regs))
 action_text = "\n".join(map(lambda reg: """
@@ -104,6 +120,7 @@ p = build_debugger_process()
 
 u = USDT(pid=int(p.pid))
 u.enable_probe(probe="ckb_vm:execute_inst", fn_name="do_execute")
+u.enable_probe(probe="ckb_vm:execute_inst_end", fn_name="do_execute_end")
 include_path = os.path.join(
   os.path.dirname(os.path.abspath(__file__)), "..", "bpfc")
 b = BPF(text=bpf_text, usdt_contexts=[u], cflags=["-Wno-macro-redefined", "-I", include_path])
@@ -114,6 +131,11 @@ print()
 
 called = b["stats"][ctypes.c_ulong(1)].value
 print("Func %s has been called %s times!" % (func_name, called))
+called = b["instruction_end_stats"][ctypes.c_ulong(1)].value
+print("Func end %s has been called %s times!" % (func_name, called))
+
+for k, v in sorted(b.get_table("return_value").items(), key=lambda kv: kv[0].value):
+    print(f"key: {k.value:016x}, value: {v.value:}")
 
 for reg in regs:
   table_name = "hash_%s" % (reg)
