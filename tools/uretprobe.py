@@ -38,64 +38,72 @@ print("Profiling func %s" % (func_name))
 bpf_text = """
 #include "riscv.h"
 
-BPF_HASH(stats, uint64_t);
-BPF_HASH(instruction_end_stats, uint64_t);
-BPF_HASH(return_value);
+BPF_HASH(num_of_effective_jumps, uint64_t);
+BPF_HASH(num_of_calling, uint64_t);
+BPF_HASH(num_of_returning, uint64_t);
+BPF_HASH(return_values, uint64_t);
+// hash map that maps the link addresses to the reference counts
+BPF_HASH(jump_from_addresses);
 
 @@DEFS@@
 
-int do_execute(struct pt_regs *ctx) {
-    uint64_t pc;
-    bpf_usdt_readarg(1, ctx, &pc);
+int do_jump(struct pt_regs *ctx) {
+    uint64_t link;
+    bpf_usdt_readarg(1, ctx, &link);
 
-    if (pc != @@PC@@) {
-      return 0;
+    uint64_t next_pc;
+    bpf_usdt_readarg(2, ctx, &next_pc);
+
+    // x calls a, link = current address in x, next_pc = start address of a
+    // y returns to a, link = x0, next_pc = some address of a
+
+    int is_calling = 0;
+    int is_returning = 0;
+    if (next_pc == @@PC@@ && link != 0) {
+        // Initialize reference of the link, increment refcount if neccesary. 
+        uint64_t initial_value = 0;
+        uint64_t *old_value = jump_from_addresses.lookup_or_try_init(&link, &initial_value);
+        if (old_value != NULL) {
+            (*old_value)++;
+        }
+        is_calling = 1;
+    }
+
+    if (next_pc >= @@PC@@ && next_pc < @@HIGH_PC@@) {
+        uint64_t *refcount = jump_from_addresses.lookup(&link);
+        if (refcount == NULL) {
+            return 1;
+            // Should be unreachable
+        }
+        (*refcount)--;
+        if (*refcount == 0) {
+            jump_from_addresses.delete(&link);
+        }
+        is_returning = 1;
+    }
+
+    if (is_returning == 0 && is_calling == 0) {
+        return 0;
     }
 
     uint64_t regs_addr;
-    bpf_usdt_readarg(4, ctx, &regs_addr);
+    bpf_usdt_readarg(3, ctx, &regs_addr);
 
     uint64_t mem_addr;
-    bpf_usdt_readarg(5, ctx, &mem_addr);
+    bpf_usdt_readarg(4, ctx, &mem_addr);
 
-    stats.increment(1);
-
-    @@ACTIONS@@
-
-    return 0;
-}
-
-int do_execute_end(struct pt_regs *ctx) {
-    uint64_t pc;
-    bpf_usdt_readarg(1, ctx, &pc);
-
-    uint64_t current_instruction;
-    bpf_usdt_readarg(3, ctx, &current_instruction);
-
-    if (pc < @@PC@@ || pc >= @@HIGH_PC@@) {
-      return 0;
+    num_of_effective_jumps.increment(1);
+    if (is_calling == 1) {
+        num_of_calling.increment(1);
     }
+    if (is_returning == 1) {
+        uint64_t ret;
+        bpf_probe_read_user(&ret, sizeof(uint64_t), (void *)(regs_addr + 8 * A0));
 
-    // 0x101000027 is the JALR with rs1 set to RA
-    if (current_instruction != 0x101000027) {
-      return 0;
+        uint64_t zero_value = 0;
+        return_values.lookup_or_try_init(&ret, &zero_value);
+        return_values.increment(ret);
     }
-
-    uint64_t regs_addr;
-    bpf_usdt_readarg(4, ctx, &regs_addr);
-
-    uint64_t mem_addr;
-    bpf_usdt_readarg(5, ctx, &mem_addr);
-
-    uint64_t ret;
-    bpf_probe_read_user(&ret, sizeof(uint64_t), (void *)(regs_addr + 8 * A0));
-
-    instruction_end_stats.increment(1);
-
-    uint64_t value = 0;
-    return_value.lookup_or_try_init(&ret, &value);
-    value = value+1;
-    return_value.update(&ret, &value);
 
     return 0;
 }
@@ -119,8 +127,7 @@ print(bpf_text)
 p = build_debugger_process()
 
 u = USDT(pid=int(p.pid))
-u.enable_probe(probe="ckb_vm:execute_inst", fn_name="do_execute")
-u.enable_probe(probe="ckb_vm:execute_inst_end", fn_name="do_execute_end")
+u.enable_probe(probe="ckb_vm:jump", fn_name="do_jump")
 include_path = os.path.join(
   os.path.dirname(os.path.abspath(__file__)), "..", "bpfc")
 b = BPF(text=bpf_text, usdt_contexts=[u], cflags=["-Wno-macro-redefined", "-I", include_path])
@@ -129,17 +136,19 @@ p.communicate(input="\n".encode())
 print()
 print()
 
-called = b["stats"][ctypes.c_ulong(1)].value
+called = b["num_of_effective_jumps"][ctypes.c_ulong(1)].value
 print("Func %s has been called %s times!" % (func_name, called))
-called = b["instruction_end_stats"][ctypes.c_ulong(1)].value
+called = b["num_of_calling"][ctypes.c_ulong(1)].value
 print("Func end %s has been called %s times!" % (func_name, called))
+called = b["num_of_returning"][ctypes.c_ulong(1)].value
+print("Func end %s has been returned %s times!" % (func_name, called))
 
-for k, v in sorted(b.get_table("return_value").items(), key=lambda kv: kv[0].value):
+for k, v in sorted(b.get_table("return_values").items(), key=lambda kv: kv[0].value):
     print(f"key: {k.value:016x}, value: {v.value:}")
 
 for reg in regs:
   table_name = "hash_%s" % (reg)
-  print("Stats for %s:" % (table_name))
+  print("num_of_effective_jumps for %s:" % (table_name))
   table = b.get_table(table_name)
   count = sum([v.value for _, v in table.items()])
   print("count: ", count)
@@ -148,7 +157,7 @@ for reg in regs:
       if v.value > 1 and k.value != 0:
           print(f"key: {k.value:016x}, value: {v.value:}")
   table_name = "hash_mem_%s" % (reg)
-  print("Stats for %s:" % (table_name))
+  print("num_of_effective_jumps for %s:" % (table_name))
   table = b.get_table(table_name)
   for k in possibly_double_freed:
       print(k, table[k])
