@@ -48,7 +48,8 @@ BPF_HASH(jump_from_addresses, uint64_t);
 @@DEFS@@
 
 int do_jump(struct pt_regs *ctx) {
-    uint64_t link;
+    // Initialize link, so that bpf verifier does not report error like R8 !read_ok
+    uint64_t link = 0;
     bpf_usdt_readarg(1, ctx, &link);
 
     uint64_t next_pc;
