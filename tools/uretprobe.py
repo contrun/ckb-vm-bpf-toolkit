@@ -43,7 +43,7 @@ BPF_HASH(num_of_calling, uint64_t);
 BPF_HASH(num_of_returning, uint64_t);
 BPF_HASH(return_values, uint64_t);
 // hash map that maps the link addresses to the reference counts
-BPF_HASH(jump_from_addresses);
+BPF_HASH(jump_from_addresses, uint64_t);
 
 @@DEFS@@
 
@@ -61,19 +61,19 @@ int do_jump(struct pt_regs *ctx) {
     int is_returning = 0;
     if (next_pc == @@PC@@ && link != 0) {
         // Initialize reference of the link, increment refcount if neccesary. 
-        uint64_t initial_value = 0;
-        uint64_t *old_value = jump_from_addresses.lookup_or_try_init(&link, &initial_value);
-        if (old_value != NULL) {
-            (*old_value)++;
-        }
+        jump_from_addresses.increment(link);
         is_calling = 1;
     }
 
     if (next_pc >= @@PC@@ && next_pc < @@HIGH_PC@@) {
+        if (link == 0) {
+            // Should be unreachable
+            return 1;
+        }
         uint64_t *refcount = jump_from_addresses.lookup(&link);
         if (refcount == NULL) {
-            return 1;
             // Should be unreachable
+            return 1;
         }
         (*refcount)--;
         if (*refcount == 0) {
