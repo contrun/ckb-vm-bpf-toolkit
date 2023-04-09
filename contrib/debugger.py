@@ -18,6 +18,8 @@ def build_debugger_process():
   popen_args = [ckb_debugger_path, "--mode", "probe", "--prompt"]
   popen_args.extend(sys.argv[1:])
 
+  print("Running ckb debugger:", popen_args)
+
   return Popen(popen_args, stdin=PIPE)
 
 def locate_bin():

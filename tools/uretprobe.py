@@ -48,37 +48,41 @@ BPF_HASH(jump_from_addresses, uint64_t);
 @@DEFS@@
 
 int do_jump(struct pt_regs *ctx) {
+    // link is always current_pc + instruction_length()
     // Initialize link, so that bpf verifier does not report error like R8 !read_ok
     uint64_t link = 0;
     bpf_usdt_readarg(1, ctx, &link);
 
-    uint64_t next_pc;
+    // next_pc is the pc address that this jump instruction intends to jump to.
+    // Initialize link, so that bpf verifier does not report error like R8 !read_ok
+    uint64_t next_pc = 0;
     bpf_usdt_readarg(2, ctx, &next_pc);
 
-    // x calls a, link = current address in x, next_pc = start address of a
-    // y returns to a, link = x0, next_pc = some address of a
+    // x calls a, link = current address in x + instruction_length(), next_pc = start address of a
+    // y returns to a, link = current address in y + instruction_length(), next_pc = some address of a
 
     int is_calling = 0;
     int is_returning = 0;
-    if (next_pc == @@PC@@ && link != 0) {
+    if (next_pc == @@PC@@) {
         // Initialize reference of the link, increment refcount if neccesary. 
         jump_from_addresses.increment(link);
         is_calling = 1;
     }
 
-    if (next_pc >= @@PC@@ && next_pc < @@HIGH_PC@@) {
-        if (link == 0) {
-            // Should be unreachable
-            return 1;
-        }
-        uint64_t *refcount = jump_from_addresses.lookup(&link);
+    // TODO: here is an edge case. Say the ret instruction with memory address ret_addr
+    // is in the end of the function func_a. When func_a returns from ret_addr, then
+    // link = mem_ret + instruction_length() which equals high pc of func_a, i.e. @@HIGH_PC@@.
+    // So we must also check next_pc == @@HIGH_PC@@, but @@HIGH_PC@@ may be the start of another
+    // function.
+    if (link > @@PC@@ && link <= @@HIGH_PC@@) {
+        uint64_t *refcount = jump_from_addresses.lookup(&next_pc);
         if (refcount == NULL) {
             // Should be unreachable
             return 1;
         }
         (*refcount)--;
         if (*refcount == 0) {
-            jump_from_addresses.delete(&link);
+            jump_from_addresses.delete(&next_pc);
         }
         is_returning = 1;
     }
@@ -87,17 +91,19 @@ int do_jump(struct pt_regs *ctx) {
         return 0;
     }
 
+    num_of_effective_jumps.increment(1);
+
     uint64_t regs_addr;
     bpf_usdt_readarg(3, ctx, &regs_addr);
 
     uint64_t mem_addr;
     bpf_usdt_readarg(4, ctx, &mem_addr);
 
-    num_of_effective_jumps.increment(1);
     if (is_calling == 1) {
         num_of_calling.increment(1);
     }
     if (is_returning == 1) {
+        num_of_returning.increment(1);
         uint64_t ret;
         bpf_probe_read_user(&ret, sizeof(uint64_t), (void *)(regs_addr + 8 * A0));
 
@@ -138,11 +144,11 @@ print()
 print()
 
 called = b["num_of_effective_jumps"][ctypes.c_ulong(1)].value
-print("Func %s has been called %s times!" % (func_name, called))
+print("Func %s has been jumped %s times!" % (func_name, called))
 called = b["num_of_calling"][ctypes.c_ulong(1)].value
-print("Func end %s has been called %s times!" % (func_name, called))
+print("Func %s has been called %s times!" % (func_name, called))
 called = b["num_of_returning"][ctypes.c_ulong(1)].value
-print("Func end %s has been returned %s times!" % (func_name, called))
+print("Func %s has been returned %s times!" % (func_name, called))
 
 for k, v in sorted(b.get_table("return_values").items(), key=lambda kv: kv[0].value):
     print(f"key: {k.value:016x}, value: {v.value:}")
