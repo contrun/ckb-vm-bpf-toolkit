@@ -45,8 +45,6 @@ BPF_HASH(return_values, uint64_t);
 // hash map that maps the link addresses to the reference counts
 BPF_HASH(jump_from_addresses, uint64_t);
 
-@@DEFS@@
-
 int do_jump(struct pt_regs *ctx) {
     // link is always current_pc + instruction_length()
     // Initialize link, so that bpf verifier does not report error like R8 !read_ok
@@ -118,17 +116,7 @@ int do_jump(struct pt_regs *ctx) {
 
 bpf_text = bpf_text.replace("@@PC@@", str(func_low_pc)).replace("@@HIGH_PC@@", str(func_high_pc))
 
-def_text = "\n".join(map(lambda reg: "BPF_HASH(hash_%s);\nBPF_HASH(hash_mem_%s);" % (reg, reg), regs))
-action_text = "\n".join(map(lambda reg: """
-uint64_t reg_{reg};
-bpf_probe_read_user(&reg_{reg}, sizeof(uint64_t), (void *)(regs_addr + 8 * {reg_up}));
-uint64_t mem_{reg};
-bpf_probe_read_user(&mem_{reg}, sizeof(uint64_t), (void *)(mem_addr + reg_{reg}));
-hash_{reg}.increment(reg_{reg});
-hash_mem_{reg}.update(&reg_{reg}, &mem_{reg});
-""".format(reg=reg, reg_up=reg.upper()), regs))
-
-bpf_text = bpf_text.replace("@@DEFS@@", def_text).replace("@@ACTIONS@@", action_text)
+print("bpf program source code:")
 print(bpf_text)
 
 p = build_debugger_process()
@@ -144,27 +132,12 @@ print()
 print()
 
 called = b["num_of_effective_jumps"][ctypes.c_ulong(1)].value
-print("Func %s has been jumped %s times!" % (func_name, called))
+print("Func %s has been jumped to/from %s times!" % (func_name, called))
 called = b["num_of_calling"][ctypes.c_ulong(1)].value
 print("Func %s has been called %s times!" % (func_name, called))
 called = b["num_of_returning"][ctypes.c_ulong(1)].value
 print("Func %s has been returned %s times!" % (func_name, called))
 
+print("Dumping return value counts for func %s" % (func_name))
 for k, v in sorted(b.get_table("return_values").items(), key=lambda kv: kv[0].value):
-    print(f"key: {k.value:016x}, value: {v.value:}")
-
-for reg in regs:
-  table_name = "hash_%s" % (reg)
-  print("num_of_effective_jumps for %s:" % (table_name))
-  table = b.get_table(table_name)
-  count = sum([v.value for _, v in table.items()])
-  print("count: ", count)
-  possibly_double_freed = [k for k, v in table.items() if v.value > 1 and k.value != 0]
-  for k, v in sorted(table.items(), key=lambda kv: kv[0].value):
-      if v.value > 1 and k.value != 0:
-          print(f"key: {k.value:016x}, value: {v.value:}")
-  table_name = "hash_mem_%s" % (reg)
-  print("num_of_effective_jumps for %s:" % (table_name))
-  table = b.get_table(table_name)
-  for k in possibly_double_freed:
-      print(k, table[k])
+    print(f"return value: {k.value:016x}, count: {v.value:}")
