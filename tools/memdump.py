@@ -38,64 +38,85 @@ print("Profiling func %s" % (func_name))
 bpf_text = """
 #include "riscv.h"
 
-BPF_HASH(stats, uint64_t);
-BPF_HASH(instruction_end_stats, uint64_t);
-BPF_HASH(return_value);
+BPF_HASH(num_of_effective_jumps, uint64_t);
+BPF_HASH(num_of_calling, uint64_t);
+BPF_HASH(num_of_returning, uint64_t);
+BPF_HASH(return_values, uint64_t);
+BPF_HASH(memory_contents, uint64_t);
+BPF_HASH(memory_addrs, uint64_t);
+// hash map that maps the link addresses to the reference counts
+BPF_HASH(jump_from_addresses, uint64_t);
 
-@@DEFS@@
+int do_jump(struct pt_regs *ctx) {
+    // link is always current_pc + instruction_length()
+    // Initialize link, so that bpf verifier does not report error like R8 !read_ok
+    uint64_t link = 0;
+    bpf_usdt_readarg(1, ctx, &link);
 
-int do_execute(struct pt_regs *ctx) {
-    uint64_t pc;
-    bpf_usdt_readarg(1, ctx, &pc);
+    // next_pc is the pc address that this jump instruction intends to jump to.
+    // Initialize link, so that bpf verifier does not report error like R8 !read_ok
+    uint64_t next_pc = 0;
+    bpf_usdt_readarg(2, ctx, &next_pc);
 
-    if (pc != @@PC@@) {
-      return 0;
+    // x calls a, link = current address in x + instruction_length(), next_pc = start address of a
+    // y returns to a, link = current address in y + instruction_length(), next_pc = some address of a
+
+    int is_calling = 0;
+    int is_returning = 0;
+    if (next_pc == @@PC@@) {
+        // Initialize reference of the link, increment refcount if neccesary. 
+        jump_from_addresses.increment(link);
+        is_calling = 1;
     }
 
-    uint64_t regs_addr;
-    bpf_usdt_readarg(4, ctx, &regs_addr);
-
-    uint64_t mem_addr;
-    bpf_usdt_readarg(5, ctx, &mem_addr);
-
-    stats.increment(1);
-
-    @@ACTIONS@@
-
-    return 0;
-}
-
-int do_execute_end(struct pt_regs *ctx) {
-    uint64_t pc;
-    bpf_usdt_readarg(1, ctx, &pc);
-
-    uint64_t current_instruction;
-    bpf_usdt_readarg(3, ctx, &current_instruction);
-
-    if (pc < @@PC@@ || pc >= @@HIGH_PC@@) {
-      return 0;
+    // TODO: here is an edge case. Say the ret instruction with memory address ret_addr
+    // is in the end of the function func_a. When func_a returns from ret_addr, then
+    // link = mem_ret + instruction_length() which equals high pc of func_a, i.e. @@HIGH_PC@@.
+    // So we must also check next_pc == @@HIGH_PC@@, but @@HIGH_PC@@ may be the start of another
+    // function.
+    if (link > @@PC@@ && link <= @@HIGH_PC@@) {
+        uint64_t *refcount = jump_from_addresses.lookup(&next_pc);
+        if (refcount == NULL) {
+            // Should be unreachable
+            return 1;
+        }
+        (*refcount)--;
+        if (*refcount == 0) {
+            jump_from_addresses.delete(&next_pc);
+        }
+        is_returning = 1;
     }
 
-    // 0x101000027 is the JALR with rs1 set to RA
-    if (current_instruction != 0x101000027) {
-      return 0;
+    if (is_returning == 0 && is_calling == 0) {
+        return 0;
     }
 
-    uint64_t regs_addr;
-    bpf_usdt_readarg(4, ctx, &regs_addr);
+    num_of_effective_jumps.increment(1);
 
-    uint64_t mem_addr;
-    bpf_usdt_readarg(5, ctx, &mem_addr);
+    uint64_t regs_addr = 0;
+    bpf_usdt_readarg(3, ctx, &regs_addr);
 
-    uint64_t ret;
-    bpf_probe_read_user(&ret, sizeof(uint64_t), (void *)(regs_addr + 8 * A0));
+    uint64_t mem_addr = 0;
+    bpf_usdt_readarg(4, ctx, &mem_addr);
 
-    instruction_end_stats.increment(1);
+    if (is_calling == 1) {
+        num_of_calling.increment(1);
+    }
+    if (is_returning == 1) {
+        num_of_returning.increment(1);
+        uint64_t ret = 0;
+        bpf_probe_read_user(&ret, sizeof(uint64_t), (void *)(regs_addr + 8 * A0));
 
-    uint64_t value = 0;
-    return_value.lookup_or_try_init(&ret, &value);
-    value = value+1;
-    return_value.update(&ret, &value);
+        uint64_t zero_value = 0;
+        return_values.lookup_or_try_init(&ret, &zero_value);
+        return_values.increment(ret);
+
+        uint64_t content = 0;
+        bpf_probe_read_user(&content, sizeof(uint64_t), (void *)(mem_addr + ret));
+        memory_contents.update(&ret, &content);
+
+        memory_addrs.increment(mem_addr);
+    }
 
     return 0;
 }
@@ -103,24 +124,13 @@ int do_execute_end(struct pt_regs *ctx) {
 
 bpf_text = bpf_text.replace("@@PC@@", str(func_low_pc)).replace("@@HIGH_PC@@", str(func_high_pc))
 
-def_text = "\n".join(map(lambda reg: "BPF_HASH(hash_%s);\nBPF_HASH(hash_mem_%s);" % (reg, reg), regs))
-action_text = "\n".join(map(lambda reg: """
-uint64_t reg_{reg};
-bpf_probe_read_user(&reg_{reg}, sizeof(uint64_t), (void *)(regs_addr + 8 * {reg_up}));
-uint64_t mem_{reg};
-bpf_probe_read_user(&mem_{reg}, sizeof(uint64_t), (void *)(mem_addr + reg_{reg}));
-hash_{reg}.increment(reg_{reg});
-hash_mem_{reg}.update(&reg_{reg}, &mem_{reg});
-""".format(reg=reg, reg_up=reg.upper()), regs))
-
-bpf_text = bpf_text.replace("@@DEFS@@", def_text).replace("@@ACTIONS@@", action_text)
+print("bpf program source code:")
 print(bpf_text)
 
 p = build_debugger_process()
 
 u = USDT(pid=int(p.pid))
-u.enable_probe(probe="ckb_vm:execute_inst", fn_name="do_execute")
-u.enable_probe(probe="ckb_vm:execute_inst_end", fn_name="do_execute_end")
+u.enable_probe(probe="ckb_vm:jump", fn_name="do_jump")
 include_path = os.path.join(
   os.path.dirname(os.path.abspath(__file__)), "..", "bpfc")
 b = BPF(text=bpf_text, usdt_contexts=[u], cflags=["-Wno-macro-redefined", "-I", include_path])
@@ -129,26 +139,21 @@ p.communicate(input="\n".encode())
 print()
 print()
 
-called = b["stats"][ctypes.c_ulong(1)].value
+called = b["num_of_effective_jumps"][ctypes.c_ulong(1)].value
+print("Func %s has been jumped to/from %s times!" % (func_name, called))
+called = b["num_of_calling"][ctypes.c_ulong(1)].value
 print("Func %s has been called %s times!" % (func_name, called))
-called = b["instruction_end_stats"][ctypes.c_ulong(1)].value
-print("Func end %s has been called %s times!" % (func_name, called))
+called = b["num_of_returning"][ctypes.c_ulong(1)].value
+print("Func %s has returned %s times!" % (func_name, called))
 
-for k, v in sorted(b.get_table("return_value").items(), key=lambda kv: kv[0].value):
-    print(f"key: {k.value:016x}, value: {v.value:}")
+print("Dumping return value counts for func %s" % (func_name))
+for k, v in sorted(b.get_table("return_values").items(), key=lambda kv: kv[0].value):
+    print(f"return value: {k.value:016x}, count: {v.value:}")
 
-for reg in regs:
-  table_name = "hash_%s" % (reg)
-  print("Stats for %s:" % (table_name))
-  table = b.get_table(table_name)
-  count = sum([v.value for _, v in table.items()])
-  print("count: ", count)
-  possibly_double_freed = [k for k, v in table.items() if v.value > 1 and k.value != 0]
-  for k, v in sorted(table.items(), key=lambda kv: kv[0].value):
-      if v.value > 1 and k.value != 0:
-          print(f"key: {k.value:016x}, value: {v.value:}")
-  table_name = "hash_mem_%s" % (reg)
-  print("Stats for %s:" % (table_name))
-  table = b.get_table(table_name)
-  for k in possibly_double_freed:
-      print(k, table[k])
+print("Dumping meomry addresses for func %s" % (func_name))
+for k, v in sorted(b.get_table("memory_addrs").items(), key=lambda kv: kv[0].value):
+    print(f"memory addr: {k.value:016x}, content: {v.value:016x}")
+
+print("Dumping meomry content for func %s" % (func_name))
+for k, v in sorted(b.get_table("memory_contents").items(), key=lambda kv: kv[0].value):
+    print(f"memory addr: {k.value:016x}, content: {v.value:016x}")

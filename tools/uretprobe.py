@@ -91,10 +91,10 @@ int do_jump(struct pt_regs *ctx) {
 
     num_of_effective_jumps.increment(1);
 
-    uint64_t regs_addr;
+    uint64_t regs_addr = 0;
     bpf_usdt_readarg(3, ctx, &regs_addr);
 
-    uint64_t mem_addr;
+    uint64_t mem_addr = 0;
     bpf_usdt_readarg(4, ctx, &mem_addr);
 
     if (is_calling == 1) {
@@ -102,7 +102,7 @@ int do_jump(struct pt_regs *ctx) {
     }
     if (is_returning == 1) {
         num_of_returning.increment(1);
-        uint64_t ret;
+        uint64_t ret = 0;
         bpf_probe_read_user(&ret, sizeof(uint64_t), (void *)(regs_addr + 8 * A0));
 
         uint64_t zero_value = 0;
@@ -136,7 +136,7 @@ print("Func %s has been jumped to/from %s times!" % (func_name, called))
 called = b["num_of_calling"][ctypes.c_ulong(1)].value
 print("Func %s has been called %s times!" % (func_name, called))
 called = b["num_of_returning"][ctypes.c_ulong(1)].value
-print("Func %s has been returned %s times!" % (func_name, called))
+print("Func %s has returned %s times!" % (func_name, called))
 
 print("Dumping return value counts for func %s" % (func_name))
 for k, v in sorted(b.get_table("return_values").items(), key=lambda kv: kv[0].value):
